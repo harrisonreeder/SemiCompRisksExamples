@@ -1,0 +1,701 @@
+---
+title: "Semi-Competing Risks Example"
+output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r, echo=T,message=F,warning=F,results='hide'}
+
+#FYI, this example will likely be updated over time!
+
+library("survival") #package for standard survival analysis
+library("forestplot") #package for making estimate `forest plot'
+library("ggplot2") #package for making some additional plots
+library("knitr") #package for knitting markdown files
+library("SemiCompRisks") #package for semi competing risks analysis
+
+#now, to install two packages from GitHub for updated semi-competing risks functions
+#note, this only needs to be done once, so it is presently commented out
+
+# library("devtools")
+# install_github("harrisonreeder/SemiCompRisksFreq")
+# install_github("harrisonreeder/SemiCompRisksPen")
+
+library("SemiCompRisksPen") #package for penalized illness-death modeling
+library("SemiCompRisksFreq") #package for frequentist illness-death modeling
+
+#color blind friendly colors from here: https://davidmathlogic.com/colorblind/#%23648FFF-%23785EF0-%23DC267F-%23FE6100-%23FFB000
+cb_blue <- "#648FFF"; cb_red <- "#DC267F"; cb_purple <- "#785EF0"; cb_orange <- "#FE6100"; cb_grey <- "#CACACA"
+
+#pink and green color-blind friendly
+four_color_paired <- RColorBrewer::brewer.pal(n=4,name="PiYG")[c(3,4,2,1)]
+# four_color_paired <- RColorBrewer::brewer.pal(n=4,name="Paired")
+
+
+#colors used in plots
+two_color_cb <- c(cb_blue,cb_red)
+
+three_color <- c("dodgerblue","firebrick3","purple3")
+three_color_cb <- c(cb_blue,cb_red,cb_purple)
+
+#take three cb colors and reduce V from 100 to 60
+three_color_cb_dark <- c("#3b5699", "#751342", "#453589")
+
+
+four_color <- c("lightgray","firebrick3","purple3","dodgerblue")
+four_color_cb <- c(cb_grey,cb_red,cb_purple,cb_blue)
+four_color_forest <- c("dodgerblue","firebrick3","purple3","magenta")
+four_color_forest_cb <- c(cb_blue,cb_red,cb_purple,cb_orange)
+five_color <- c("lightgray","firebrick3","magenta","purple3","dodgerblue")
+five_color_cb <- c(cb_grey,cb_red,cb_orange,cb_purple,cb_blue)
+
+# RColorBrewer::display.brewer.all(n=4,colorblindFriendly = TRUE)
+# color-blind friendly categorical colors
+three_color_qual <- RColorBrewer::brewer.pal(n=3,name="Set2")
+four_color_qual <- RColorBrewer::brewer.pal(n=4,name="Dark2")
+five_color_qual <- RColorBrewer::brewer.pal(n=5,name="Dark2")
+
+```
+
+
+# {.tabset .tabset-fade .tabset-pills} 
+
+## Data Review 
+
+```{r, eval=T,echo=T,message=F,warning=F, results='hide'}
+
+data("scrData") #load sample dataset from SemiCompRisks package
+
+#for examples below, create a binary covariate
+scrData$x1_bin <- as.numeric(scrData$x1>0)
+
+#define "sojourn time"
+scrData$sojourn <- scrData$time2 - scrData$time1
+
+#define version of terminal flag that treats non-terminal event as censoring
+scrData$event2_cr <- ifelse(scrData$event1==1, 0, scrData$event2)
+#define version of event flag that is 0 for censoring, 1 for non-terminal, 2 for terminal
+#for use when fitting strictly competing risks models
+scrData$event_cr_num <- ifelse(scrData$event1==1, 1, ifelse(scrData$event2==1,2,0))
+scrData$event_cr_fct <- factor(scrData$event_cr_num,levels=c("0","1","2"),
+                               labels=c("cens","nonterm","term"))
+
+outcome_vec <- numeric(NROW(scrData))
+outcome_vec[scrData$event1==1 & scrData$event2==0] <- 1
+outcome_vec[scrData$event1==0 & scrData$event2==1] <- 2
+outcome_vec[scrData$event1==1 & scrData$event2==1] <- 3
+scrData$outcome_cat <- factor(as.character(outcome_vec), levels=c("0","1","2","3"),
+                              labels=c("neither","nonterm_only","term_only","both"))
+
+#roughly choose quartiles of data
+scrData$t1_cat <- as.factor(cut(scrData$time1,
+                                breaks=c(0,.7,4.4,27,Inf),
+                                right = FALSE,include.lowest = TRUE,labels=FALSE))
+scrData <- cbind(scrData,
+                 as.data.frame(model.matrix(~ 0 + t1_cat, scrData)))
+
+
+```
+
+
+### Timing of Outcomes
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+#Empirical "Density" Plot
+scat_plot <- ggplot(data=scrData[scrData$event1==1,],
+                    mapping = aes(x=time1,
+                                  y=time2, color=as.factor(event2))) +
+  xlab("T1") +
+  ylab("T2") + xlim(0,62) + ylim(0,62) +
+  geom_point(alpha=0.25,size=1) + theme_classic() +
+  geom_abline(slope=1) + 
+  theme(legend.position = "bottom")
+#histogram of terminal only times
+hist_plot <- ggplot(data=scrData[scrData$event1==0,],
+                    mapping = aes(x=time2,fill=as.factor(event2))) + 
+  xlim(0,62) +
+  geom_histogram(binwidth = 1,col="white",linewidth=0.25) +
+  theme_classic() + coord_flip() + xlab("T2 without T1") + 
+  ylab("Count")  +
+  theme(legend.position = "bottom", legend.title = element_blank())
+#combined "empirical joint density"
+cowplot::plot_grid(scat_plot,hist_plot, nrow = 1, rel_widths = c(7,3))
+
+
+#km curve for delivery overall
+fit_km_term <- survfit(Surv(time2, event=event2) ~ 1, data=scrData)
+plot(fit_km_term,fun="F",conf.int = TRUE)
+
+#aalen-johansson curv es for CIF of preeclampsia and delivery competing risks
+fit_aj_cr <- survfit(Surv(time1, event=event_cr_fct) ~ 1, data=scrData)
+plot(fit_aj_cr,col = two_color_cb,lwd=2, conf.int=TRUE)
+
+
+```
+
+## Analysis {.tabset .tabset-fade .tabset-pills} 
+
+### Univariate Models {.tabset .tabset-fade .tabset-pills} 
+
+#### X1 (Binary) {.tabset .tabset-fade .tabset-pills} 
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+form_h1 <- Formula::as.Formula("time1 + event1 ~ x1_bin")
+form_h2 <- Formula::as.Formula("time1 + event2_cr ~ x1_bin")
+#remember this should be used with subset of those with PE
+form_h3 <- Formula::as.Formula("sojourn + event2 ~ x1_bin")
+
+#list to store the univariate models
+uni_freq_fit_list <- list()
+
+#let's loop through every possible baseline
+for(haz in c("wb", "bs", "pw","rp", NULL)){
+  print(haz)
+  #set number of baseline parameters depending on specification
+  p0_temp <- if(haz=="wb") 2 else 4
+  
+  #knot locations will be set automatically
+
+  #first, fit "cause-specific" hazard for non-terminal event
+  uni_freq_fit_list[[paste0(haz,"_",1)]] <-
+    SemiCompRisksFreq::FreqSurv_HReg2(Formula=form_h1,
+      data = scrData, hazard = haz,
+      p0 = p0_temp, optim_method = "BFGS")
+  
+  #second, fit "cause-specific" hazard for terminal event
+  uni_freq_fit_list[[paste0(haz,"_",2)]] <-
+    SemiCompRisksFreq::FreqSurv_HReg2(Formula=form_h2,
+      data = scrData, hazard = haz,
+      p0 = p0_temp, optim_method = "BFGS")
+  
+  #third, fit hazard for terminal event following non-terminal event
+  #on 'sojourn time' scale, following semi-markov model structure
+  uni_freq_fit_list[[paste0(haz,"_",3)]] <-
+    SemiCompRisksFreq::FreqSurv_HReg2(Formula=form_h3,
+      data = scrData[scrData$event1==1,],
+      hazard = haz, p0 = p0_temp, optim_method = "BFGS")
+}
+
+#next, fit corresponding kaplan meier curves stratified by binary X1
+uni_freq_fit_list[[paste0("km_",1)]] <- 
+  survfit(Surv(time=time1, event=event1) ~ x1_bin,
+                      data=scrData)
+uni_freq_fit_list[[paste0("km_",2)]] <- 
+  survfit(Surv(time=time1, event=event2_cr) ~ x1_bin,
+                      data=scrData)
+uni_freq_fit_list[[paste0("km_",3)]] <- 
+  survfit(Surv(time=sojourn, event=event2) ~ x1_bin,
+                      data=scrData[scrData$event1==1,])
+
+#next, fit corresponding kaplan meier curves stratified by binary X1
+uni_freq_fit_list[[paste0("cox_",1)]] <- 
+  coxph(Surv(time=time1, event=event1) ~ x1_bin,
+                      data=scrData)
+uni_freq_fit_list[[paste0("cox_",2)]] <- 
+  coxph(Surv(time=time1, event=event2_cr) ~ x1_bin,
+                      data=scrData)
+uni_freq_fit_list[[paste0("cox_",3)]] <- 
+  coxph(Surv(time=sojourn, event=event2) ~ x1_bin,
+                      data=scrData[scrData$event1==1,])
+
+
+```
+
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+#function is very steep near zero
+t_seq <- c(0.001,0.005,0.01,0.05,seq(from=1, to=60, by=0.1))
+
+for(bl in c("wb","bs","pw","rp")){
+  bl_label <- switch(bl, "wb"="Weibull", "bs"="B-Spline",
+                         "pw"="Piecewise Constant","rp"="Royston-Parmar")
+  for(haz in 1:2){
+    pred0 <- SemiCompRisksFreq:::predict.Freq_HReg2(uni_freq_fit_list[[paste0(bl,"_",haz)]],
+                     tseq=t_seq, xnew = as.matrix(c(0)))
+    pred1 <- SemiCompRisksFreq:::predict.Freq_HReg2(uni_freq_fit_list[[paste0(bl,"_",haz)]],
+                     tseq=t_seq, xnew = as.matrix(c(1)))
+
+    plot(uni_freq_fit_list[[paste0("km_",haz)]],
+         lwd=2, lty=1, col=four_color_paired[c(1,3)],
+         xlab="Time",
+         ylab=switch(haz,
+                     "Survivor Function of Non-Terminal",
+                     "Survivor Function of Terminal"))
+    matplot(x = t_seq,
+            y = cbind(pred0$S$S,pred1$S$S),
+            type = "l", add=T,
+            lwd=2, lty=1, col=four_color_paired[c(2,4)])
+    legend(x = "bottomleft", fill=four_color_paired,
+           legend = c("Kaplan-Meier, no X1",
+                      paste0(bl_label,", no X1"),
+                      "Kaplan-Meier, X1",
+                      paste0(bl_label,", X1")) )
+  }
+
+  #h3 plotted on sojourn scale
+  pred0 <- SemiCompRisksFreq:::predict.Freq_HReg2(uni_freq_fit_list[[paste0(bl,"_",3)]],
+                   tseq=t_seq, xnew = as.matrix(c(0)))
+  pred1 <- SemiCompRisksFreq:::predict.Freq_HReg2(uni_freq_fit_list[[paste0(bl,"_",3)]],
+                   tseq=t_seq, xnew = as.matrix(c(1)))
+
+  plot(uni_freq_fit_list[[paste0("km_",3)]],xlim=c(0,5),
+       lwd=2, lty=1, col=four_color_paired[c(1,3)],
+       xlab="Sojourn Time",
+       ylab="Conditional Survivor Function of Terminal")
+  matplot(x = t_seq,
+          y= cbind(pred0$S$S,pred1$S$S),
+          type = "l", add=T,
+          lwd=2, lty=1, col=four_color_paired[c(2,4)])
+  legend(x = "bottomleft", fill=four_color_paired,
+         legend = c("Kaplan-Meier, no X1",
+                    paste0(bl_label,", no X1"),
+                    "Kaplan-Meier, X1",
+                    paste0(bl_label,", X1")))
+}
+
+#get hazard ratios from every fit
+exp(sapply(uni_freq_fit_list[c("wb_1","wb_2","wb_3",
+                               "bs_1","bs_2","bs_3",
+                               "pw_1","pw_2","pw_3",
+                               "rp_1","rp_2","rp_3")],
+       function(x) x$estimate["x1_bin"]))
+summary(uni_freq_fit_list$cox_1)$coefficient
+summary(uni_freq_fit_list$cox_2)$coefficient
+summary(uni_freq_fit_list$cox_3)$coefficient
+
+```
+
+
+### Illness-Death Models {.tabset .tabset-fade .tabset-pills}
+
+Once we've explored the data sufficiently, we may fit actual gamma-frailty illness death models. Here we focus on methods where each transition submodel has a proportional hazards specification.
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+form_temp <- Formula::Formula(time1 + event1 | time2 + event2 ~ x1 + x2 + x3 | x1 + x2 + x3 | x1 + x2 + x3)
+form_temp_t1cat <- Formula::Formula(time1 + event1 | time2 + event2 ~ x1 + x2 + x3 | x1 + x2 + x3 | x1 + x2 + x3 + t1_cat2 + t1_cat3 + t1_cat4)
+
+#pick best of two different optimization algorithms
+opt_meth <- c("BFGS","L-BFGS",NULL)
+
+std_freq_fit_list <- list()
+for(haz in c("wb","pw","bs","rp",
+             NULL)){
+  for(frail in c("frail","nofrail",
+                 NULL)){
+    print(paste0(haz," ",frail))
+    #set number of baseline parameters depending on specification
+    nP0_temp <- if(haz=="wb") c(2,2,2) else nP0_temp <- c(4,4,4)
+    
+    print("markov")
+    std_freq_fit_list[[paste0(haz,"_markov","_",frail)]] <-
+      SemiCompRisksFreq::FreqID_HReg2(Formula=form_temp, data = scrData,
+                                      hazard = haz, model = "Markov",
+                                      nP0 = nP0_temp,
+                                      frailty = (frail=="frail"), 
+                                      optim_method = opt_meth,
+                                      extra_starts = 0)
+    print("not1")
+    std_freq_fit_list[[paste0(haz,"_not1cat","_",frail)]] <-
+      SemiCompRisksFreq::FreqID_HReg2(Formula=form_temp, 
+                                      data = scrData,
+                                      hazard = haz, model = "semi-Markov",
+                                      nP0 = nP0_temp,
+                                      frailty = (frail=="frail"), 
+                                      optim_method = opt_meth,
+                                      extra_starts = 0)
+    print("t1cat")
+    std_freq_fit_list[[paste0(haz,"_t1cat","_",frail)]] <-
+      SemiCompRisksFreq::FreqID_HReg2(Formula=form_temp_t1cat, 
+                                      data = scrData,
+                                      hazard = haz, model = "semi-Markov",
+                                      nP0 = nP0_temp,
+                                      frailty = (frail=="frail"), 
+                                      optim_method = opt_meth,
+                                      extra_starts = 0)
+  }
+}
+
+sapply(std_freq_fit_list,logLik)
+
+for(haz in c("wb","pw","bs","rp",
+             NULL)){
+  for(frail in c("frail",
+                 "nofrail",
+                 NULL)){
+    print(paste0(haz," ",frail))
+    temp_fit <- std_freq_fit_list[[paste0(haz,"_t1cat","_",frail)]]
+    print(temp_fit)
+    print(summary(temp_fit))
+    pred_temp_fit <- SemiCompRisksFreq:::predict.Freq_HReg2(temp_fit)
+    # print(pred_temp_fit)
+    plot(pred_temp_fit)
+  }
+}
+
+```
+
+##### Baseline Plots
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+#specifically, we will look at semi-markov model with categorical t1
+#first, create "dummy" data to predict baselines for each t1 category
+t1cat_pred_mat <- as.data.frame(matrix(data = 0,nrow=4,ncol=3,dimnames = list(NULL,c("x1","x2","x3"))))
+t1cat_pred_mat$t1_cat2 <- c(0,1,0,0)
+t1cat_pred_mat$t1_cat3 <- c(0,0,1,0)
+t1cat_pred_mat$t1_cat4 <- c(0,0,0,1)
+
+#let's just look at frailty-based models
+frail <- "frail"
+
+for(bl in c("wb","bs","pw","rp")){
+  par(mfrow=c(2,3))
+  pred <- SemiCompRisksFreq:::predict.Freq_HReg2(std_freq_fit_list[[paste0(bl,"_t1cat_",frail)]], tseq=t_seq)
+  for(ty in c("h","S")){
+    for(i in 1:2){
+      plot_mat <- pred[[paste0(ty,".",i)]][,paste0(c(ty,"LL","UL"),".",i)]
+      matplot(x=t_seq, ylim = if(ty=="S") c(0,1) else NULL,
+              y=plot_mat, type="l", lty=c(1,3,3), col="black",
+              ylab=switch(paste0(ty,"_",i),
+                          "h_1"="Cause-Specific Hazard of Non-Terminal",
+                          "h_2"="Cause-Specific Hazard of Terminal",
+                          "S_1"="Survivor Function of Non-Terminal",
+                          "S_2"="Survivor Function of Terminal"),
+              xlab=if(i==3) "Sojourn Time" else "Time",
+              add = FALSE)
+      if(ty=="S" & i==1){
+        legend(x="bottomleft",lty=c(1,3), legend=c("Estimate","95% CI"),col="black")
+      }
+    }
+    plot_mat <- sapply(1:NROW(t1cat_pred_mat), function(j){
+      pred <- SemiCompRisksFreq:::predict.Freq_HReg2(std_freq_fit_list[[paste0(bl,"_t1cat_",frail)]],
+                                                     tseq=t_seq, x3new = as.matrix(t1cat_pred_mat[j,]))
+      pred[[paste0(ty,".",3)]][[paste0(ty,".",3)]]
+    })
+    matplot(x=t_seq, #sub=bl,
+            ylim = if(ty=="S") c(0,1) else NULL,
+            y=plot_mat, type="l", col = 1 + 1:NROW(t1cat_pred_mat),
+            lty = ifelse(frail=="nofrail",2,1),
+            ylab=switch(ty,"h"="Conditional Hazard of Delivery",
+                        "S"="Conditional Survivor Function of Delivery"),
+            xlab="Sojourn Time (Weeks)", add = FALSE)
+  }
+  par(mfrow=c(1,1))
+}
+
+```
+
+##### Forest Plots
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+
+####function for generating labeled forest plot from ID model fit ("standard")
+gen_forest_plot <- function(complete_coefs,
+                            title=""){
+  tabletext <- rownames(complete_coefs)
+  forestplot(tabletext,
+             mean = cbind(complete_coefs[,1],complete_coefs[,4],complete_coefs[,7]),
+             lower = cbind(complete_coefs[,2],complete_coefs[,5],complete_coefs[,8]),
+             upper = cbind(complete_coefs[,3],complete_coefs[,6],complete_coefs[,9]),
+             title = title, xlog=TRUE,
+             boxsize = .1,
+             zero=1, xticks.digits = 1,
+             xlab="Hazard Ratio (Estimate, 95% CrI)",
+             legend=c("Non-Terminal", "Terminal without\nNon-Terminal",
+                      "Terminal after\nNon-Terminal"),
+             col= fpColors(box=three_color_cb,lines=three_color_cb),
+             lty.ci = c(1, 1,1),
+             lwd.ci = c(1.5,1.5,1.5),
+             txt_gp = fpTxtGp(xlab=gpar(cex=1.2),ticks=gpar(cex=1.15),),
+             hrzl_lines=rep(list(gpar(lwd=2, lineend="butt", col="lightgray")),
+                            length(tabletext)+1)
+  )
+}
+
+
+for(t1_ind in c("not1cat",
+                "t1cat",
+                NULL)){
+  for(haz in c("wb",
+               "pw",
+               "bs",
+               "rp",
+               NULL)){
+    for(frail in c("frail",
+                   "nofrail",
+                   NULL)){
+      temp_coef_mat <- SemiCompRisksFreq:::summary.Freq_HReg2(std_freq_fit_list[[paste0(haz,"_",t1_ind,"_",frail)]])$HR
+      temp_coef_mat_sub <- temp_coef_mat[stringr::str_detect(rownames(temp_coef_mat),
+                                                    "time_to_admit",negate = TRUE),]
+      print(gen_forest_plot(complete_coefs = temp_coef_mat_sub))
+    }
+  }
+}
+
+```
+
+####Prediction Plots
+
+
+
+```{r, eval=T,echo=T,message=F,warning=F}
+
+#used to plot predictions
+library(dplyr)
+library(tidyr)
+
+get_sample_plot <- function(pred_selected, t_cutoff_vec, i,
+                            plot_type = "stacked"){
+  # browser()
+  #create long-format data to plot
+  plot_frame <- cbind(Time=t_cutoff_vec,
+                      as.data.frame(pred_selected)) %>%
+    pivot_longer(cols=starts_with("p_"), names_to = "Outcome", values_to = "Probability")
+
+  plot_frame_factor <- plot_frame %>%
+    mutate(Outcome = recode_factor(Outcome,
+                                   "p_neither"="Pregnant without\nPreeclampsia",
+                                   "p_tonly"="Delivered without\nPreeclampsia",
+                                   "p_both"="Delivered with\nPreeclampsia",
+                                   "p_ntonly"="Pregnant with\nPreeclampsia"))
+
+  color_temp <- four_color_cb
+
+  gg <- ggplot(plot_frame_factor, aes(x=Time, y=Probability))
+  if(plot_type == "line"){
+    gg <- gg + geom_line(aes(colour=Outcome)) #+
+#      guides(colour = guide_legend(reverse = T))
+  } else{
+   gg <- gg + geom_area(aes(colour=Outcome, fill=Outcome)) +
+     scale_fill_manual(values = color_temp) #+
+#     guides(colour = guide_legend(reverse = T),fill = guide_legend(reverse = T))
+  }
+  gg <- gg +
+    scale_color_manual(values = color_temp) +
+    labs(tag = LETTERS[i]) +
+    theme_classic() + theme(text=element_text(size=14))
+}
+
+#https://stackoverflow.com/questions/39011020/ggplot-align-plots-together-and-add-common-labels-and-legend
+#extract legend
+get_legend <- function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### PREDICTION PLOTS ####
+#same set of covariates for every transition (except categorical), so this same matrix used for all inputs
+test_xtemp <- as.matrix(scrData[,c("x1","x2","x3")])
+
+#### Sample Predictions ####
+
+#now, to create four sample patients 
+cov_mat <- cbind("x1"=c(0,1,0,0),
+                 "x2"=c(0,0,1,0),
+                 "x3"=c(0,0,0,1))
+
+#first, generate predictions for every sample subject across time, and corresponding plots
+std_pred_c_selected_list <- list()
+std_pred_m_selected_list <- list()
+for(t1_ind in c("not1cat","t1cat")){
+  for(frail_ind in c("frail",#"nofrail",
+                     NULL)){
+    print(paste0(t1_ind,"_",frail_ind))
+    temp_para <- std_freq_fit_list[[paste0("wb_",t1_ind,"_",frail_ind)]]$estimate
+    pred_c_selected <- calc_risk(para = temp_para,
+                          Xmat1 = cov_mat, Xmat2 = cov_mat,
+                          Xmat3 = cov_mat,
+                          frailty = TRUE,  #say frailty=TRUE even if it's not doesn't matter in this case
+                          model = "semi-markov",
+                          type = "conditional", gamma = 1,
+                          hazard = "weibull",
+                          t_cutoff = t_seq, tol = 1e-3,
+                          h3_tv = if(t1_ind == "t1cat") "piecewise" else "none",
+                          h3tv_knots = if(t1_ind == "t1cat") c(0,.7,4.4,27) else NULL)
+    # apply(pred_c_selected,MARGIN = c(3,1),FUN = sum)
+    std_pred_c_selected_list[[paste0(t1_ind,"_",frail_ind)]] <- pred_c_selected
+
+    if(frail_ind == "frail"){
+      #just testing to see if it worked for larger frailty variances
+      # temp_para2 <- temp_para
+      # temp_para2[7] <- 0.5
+      pred_m_selected <- calc_risk(para = temp_para,
+                            Xmat1 = cov_mat, Xmat2 = cov_mat,
+                            Xmat3 = cov_mat,
+                            frailty = TRUE,  #say frailty=TRUE even if it's not doesn't matter in this case
+                            model = "semi-markov", #n_quad=15,
+                            type = "marginal", hazard = "weibull",
+                            t_cutoff = t_seq, tol = 1e-3,
+                            h3_tv = if(t1_ind == "t1cat") "piecewise" else "none",
+                            h3tv_knots = if(t1_ind == "t1cat") c(0,.7,4.4,27) else NULL)
+      std_pred_m_selected_list[[paste0(t1_ind,"_",frail_ind)]] <- pred_m_selected
+    }
+  }
+}
+
+
+#next, generate plots for the sample subjects
+std_profile_plot_list <- list()
+for(t1_ind in c("not1cat","t1cat",
+                NULL)){
+  for(frail_ind in c("frail",#"nofrail",
+                     NULL)){
+    temp_list <- list()
+    #generate four plots
+    for(i in 1:4){
+      temp_list[[i]] <-
+        get_sample_plot(pred_selected = std_pred_c_selected_list[[paste0(t1_ind,"_",frail_ind)]][,,paste0("i",i)],
+                        t_cutoff_vec = t_seq, i=i)
+    }
+    #get one horizontal legend for everyone and then strip them of legends and labels
+    gg_legend_horizontal <- get_legend(temp_list[[1]] + theme(legend.position = "bottom",legend.title = element_blank()))
+    for(i in 1:4){
+      temp_list[[i]] <- temp_list[[i]] + theme(legend.position="none",axis.title=element_blank())
+    }
+    #make 2 by 2 plot grid without legend or labels
+    std_profile_plot_list[[paste0(t1_ind,"_",frail_ind)]] <-
+      cowplot::plot_grid(temp_list[[1]], temp_list[[2]],
+                         temp_list[[3]], temp_list[[4]],ncol =2, align="v")
+  }
+}
+
+#finally, plot the final subject sample plots
+# cairo_pdf(file = paste0(figurepath,"sampleplots_std_freq_2023-03-10.pdf"),
+#           width=9,height=6,onefile = TRUE)
+for(t1_ind in c(#"not1cat",
+                "t1cat",
+                NULL)){
+  for(frail_ind in c("frail",#"nofrail",
+                     NULL)){
+    gridExtra::grid.arrange(
+      gridExtra::arrangeGrob(std_profile_plot_list[[paste0(t1_ind,"_",frail_ind)]],
+                             bottom=grid::textGrob(label= "Time",
+                                                   gp= gpar(fontsize=14,col="black")),
+                             left=grid::textGrob(label="Probability of Having Experienced Outcome",
+                                                 rot=90, gp= gpar(fontsize=14,col="black"))),
+      gg_legend_horizontal,heights=c(6,1))
+  }
+}
+
+
+#### Gamma-stratified Sample Predictions ####
+std_pred_c_strat_gamma_list <- list()
+std_gamma_strat_plot_list <- list()
+std_gamma_strat_plot_wide_list <- list()
+for(t1_ind in c("not1cat","t1cat")){
+  print(paste0(t1_ind,"_frail"))
+  gamma_vec2 <- exp(c(-0.75,-0.25,0.25,0.75))
+  temp_para <- std_freq_fit_list[[paste0("wb_",t1_ind,"_",frail_ind)]]$estimate
+  std_pred_c_strat_gamma_list[[paste0(t1_ind,"_frail")]] <- list()
+  for(i in 1:length(gamma_vec2)){
+    pred_c_strat_gamma <- calc_risk(para = temp_para,
+             Xmat1 = cov_mat[4,,drop=FALSE], Xmat2 = cov_mat[4,,drop=FALSE],
+             Xmat3 = cov_mat[4,,drop=FALSE],
+             frailty = TRUE,  #say frailty=TRUE even if it's not doesn't matter in this case
+             model = "semi-markov",
+             type = "conditional", gamma = gamma_vec2[i],
+             hazard = "weibull",
+             t_cutoff = t_seq, tol = 1e-3,
+             h3_tv = if(t1_ind == "t1cat") "piecewise" else "none",
+             h3tv_knots = if(t1_ind == "t1cat") c(0,.7,4.4,27) else NULL)
+
+    temp_list[[i]] <-
+      get_sample_plot(pred_selected = pred_c_strat_gamma,t_cutoff_vec = t_seq,
+              i = NULL,plot_type = "stacked") +
+      theme(legend.position="none",axis.title=element_blank()) +
+      labs(subtitle = paste0("log \U03B3=",log(gamma_vec2[i])))
+    std_pred_c_strat_gamma_list[[paste0(t1_ind,"_frail")]][[i]] <- pred_c_strat_gamma
+  }
+  std_gamma_strat_plot_list[[paste0(t1_ind,"_frail")]] <-
+    cowplot::plot_grid(temp_list[[1]], temp_list[[2]],
+                       temp_list[[3]], temp_list[[4]],ncol =2, align="v")
+  std_gamma_strat_plot_wide_list[[paste0(t1_ind,"_frail")]] <-
+    cowplot::plot_grid(temp_list[[1]], temp_list[[2]],
+                       temp_list[[3]], temp_list[[4]],ncol=4, align="v")
+}
+
+#finally, plot the final sample plots
+# cairo_pdf(file = paste0(figurepath,"gammastratplots_std_freq_2023-10-10.pdf"),
+#           width=9,height=6,onefile = TRUE)
+for(t1_ind in c("not1cat","t1cat")){
+
+  gridExtra::grid.arrange(
+    gridExtra::arrangeGrob(std_gamma_strat_plot_list[[paste0(t1_ind,"_frail")]],
+                           bottom=grid::textGrob(label= "Time",
+                                                 gp= gpar(fontsize=14,col="black")),
+                           left=grid::textGrob(label="Probability of Having Experienced Outcome",
+                                               rot=90, gp= gpar(fontsize=14,col="black"))),
+    gg_legend_horizontal,heights=c(6,1))
+}
+
+#### Week 28 Conditional Plots ####
+t_cutoff_vec_term <- seq(from=1,to=60,by = 0.1)
+cov_mat_28 <- cbind(cov_mat,
+                    t1_cat2=c(1,1,1,1),
+                    t1_cat3=c(0,0,0,0),
+                    t1_cat4=c(0,0,0,0))
+#make a matrix of plots
+std_term_plot_list <- list()
+for(t1_ind in c("not1cat","t1cat")){
+  for(frail_ind in c("frail",#"nofrail",
+                     NULL)){
+    print(paste0(t1_ind,"_",frail_ind))
+    # std_term_plot_list[[paste0(t1_ind,"_",frail_ind)]] <-
+    #   matrix(nrow=length(t_cutoff_vec_term),ncol=4,dimnames = list(NULL,LETTERS[1:4]))
+      std_term_plot_list[[paste0(t1_ind,"_",frail_ind)]] <-
+        t(calc_risk_term(para = temp_para,
+                       Xmat3 = cov_mat,
+                       hazard = "weibull", frailty=TRUE,
+                       t_cutoff = t_cutoff_vec_term, t_start=0.8,
+                       # type = if(frail_ind=="frail") "marginal" else "conditional",
+                       type = "conditional",
+                       gamma = 1, tol = 1e-3,
+                       h3_tv = if(t1_ind=="t1cat") "piecewise" else "none",
+                       h3tv_knots =  c(0,.7,4.4,27))) #h3 effect of t1 was at 28, 32, 34, and 37
+      colnames(std_term_plot_list[[paste0(t1_ind,"_",frail_ind)]]) <- LETTERS[1:4]
+  }
+}
+
+#note, this generates plots out of order from other loops because it's easier
+for(frail_ind in c("frail",#"nofrail",
+                   NULL)){
+  for(t1_ind in c("not1cat","t1cat")){
+    print(paste0(t1_ind,"_",frail_ind))
+
+    matplot(x=t_cutoff_vec_term,
+            y=1-std_term_plot_list[[paste0(t1_ind,"_",frail_ind)]],
+            type="l", lty=1, lwd=2,
+            col = four_color_qual,
+            ylim = c(0,1), axes=FALSE,
+            ylab="Cumulative Probability of Terminal after Non-terminal at Time 1",
+            xlab="Gestational Age (Weeks)", add = FALSE )
+    axis(side = 1, at = c(0,20,40,60))
+    axis(side = 2, at = c(0,0.25,0.5,0.75,1))
+    legend(x="topleft",legend = LETTERS[1:4],fill = four_color_qual,
+           title = "Individual")
+  }
+}
+
+```
